@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-local-memory
+      name: dsh-local-memory
+      config: {}
