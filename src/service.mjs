@@ -24,7 +24,7 @@ import { createArchiveOutbox, normalizeArchiveOutConfig } from './archive-out.mj
 import { isSubjectId } from '../../_shared/contracts.mjs'
 import { resolveSubject } from '../../_shared/subject.mjs'
 import {
-  addManualMemory, archiveDecayedToFull, clearFirstMeeting, compactMemoryCard, createEmptyCard,
+  addManualMemory, archiveDecayedToFull, archiveRetiredToFull, clearFirstMeeting, compactMemoryCard, createEmptyCard,
   designateFirstMeeting, ensureFullArchiveStatsAsync, fullMemoryCardStatus, ingestBiliEntries, ingestInboxLines, loadMemoryCard, maintainMemoryCard, memoryCardStatus, mergeMemories,
   markOwnerNotified, needsDailyDecay, normalizeCard, normalizeMemoryCardConfig, readArchiveRecordPage, recallFullMemoryAsync, redactForMemory, refreshInitialState, renderMemoryCard, resolveMemoryCardPaths, saveFullMemoryCard, saveMemoryCardOutputs, shouldNotifyOwner,
 } from './card-engine.mjs'
@@ -118,7 +118,7 @@ export function createMemoryService({ stateDir, biliMemory = null, qqFeedFile = 
   const archiveOutbox = archiveSend
     ? createArchiveOutbox({
       stateDir,
-      fullJsonl: paths.fullJsonl,
+      ledgerJsonl: paths.retiredJsonl,
       config: () => { try { return readConfigFile().archiveOut ?? {} } catch { return {} } },
       subject: ensureSubject,
       send: archiveSend,
@@ -161,7 +161,7 @@ export function createMemoryService({ stateDir, biliMemory = null, qqFeedFile = 
     if (!existsSync(configFile)) return normalizeMemoryCardConfig({ notifyOwner: false })
     return normalizeMemoryCardConfig(JSON.parse(readFileSync(configFile, 'utf8')).memoryCard ?? {})
   }
-  // cardInjection 段：常驻记忆卡注入的开关与范围（默认关），见 card-prompt.mjs。
+  // cardInjection 段：记忆卡 runtime context 投递的开关与范围（默认关），见 card-prompt.mjs。
   const injectionConfig = () => {
     try { return readConfigFile().cardInjection ?? {} } catch { return {} }
   }
@@ -511,7 +511,7 @@ export function createMemoryService({ stateDir, biliMemory = null, qqFeedFile = 
     }
     await fs.promises.rm(biliRefreshIntent)
   }
-  function applyManualAction(current, action, payload, cfg, now, evicted = null) {
+  function applyManualAction(current, action, payload, cfg, now, evicted = null, retired = null) {
     let outcome = { ok: true }
     if (action === 'add') {
       const result = addManualMemory(current, { ...payload, text: redactForMemory(payload.text, { scope: payload.scope === 'bili' || payload.scope === 'shared' ? 'bili' : 'qq' }) }, cfg, now, evicted)
@@ -555,13 +555,14 @@ export function createMemoryService({ stateDir, biliMemory = null, qqFeedFile = 
     } else if (action === 'forget') {
       const item = current.records.find(record => record.id === String(payload.id ?? ''))
       if (!item || item.pinned) throw new Error('Memory not found or pinned')
+      if (retired && !item.retiredAt) retired.push({ record: item, reason: 'forgotten' })
       current.records = current.records.filter(record => record !== item)
       current.stats.forgotten = (Number(current.stats.forgotten) || 0) + 1
     } else if (action === 'ack') {
       current.alerts.acknowledgedLevel = Math.max(0, Math.min(3, Number(payload.level) || Number(current.alerts.level) || 0))
       current.alerts.acknowledgedAt = new Date(now).toISOString()
     } else if (action === 'compact') {
-      outcome.steps = compactMemoryCard(current, cfg, { targetRatio: payload.targetRatio ?? 0.8, now })
+      outcome.steps = compactMemoryCard(current, cfg, { targetRatio: payload.targetRatio ?? 0.8, now, retired })
       current.lastMaintenanceAt = new Date(now).toISOString()
     }
     else if (action === 'set-first-meet') outcome = designateFirstMeeting(current, payload.ids, { now })
@@ -632,10 +633,12 @@ export function createMemoryService({ stateDir, biliMemory = null, qqFeedFile = 
     } else {
       const { card: current } = await prepareActMem()
       archiveDecayedToFull(paths, current, cfg, pending.now, existing)
-      const evicted = []
-      outcome = applyManualAction(current, pending.action, pending.payload, cfg, pending.now, evicted)
+      const evicted = [], retired = []
+      outcome = applyManualAction(current, pending.action, pending.payload, cfg, pending.now, evicted, retired)
       const records = [...new Map([...evicted, ...current.records].map(record => [record.id, record])).values()]
       archiveDecayedToFull(paths, { ...current, records }, cfg, pending.now, existing)
+      for (const record of evicted) if (!record.retiredAt) retired.push({ record, reason: 'evicted' })
+      if (retired.length) archiveRetiredToFull(paths, retired, pending.now)
       if (evicted.length) refreshInitialState(current)
       current.meta.manualAction = { id: pending.id }
       saveMemoryCardOutputs(paths, current, cfg, pending.now)

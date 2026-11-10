@@ -49,6 +49,12 @@ export const CLARITY_LABEL = Object.freeze({
   forgotten: '已遗忘',
 });
 
+/**
+ * 入档（投递到 MemPalace）条件：清晰度退到「模糊」及以下，或记录已经离开卡片。
+ * 只改这里就能把门槛挪到更晚的 `trace`；芯片上仍然保留未退色的记忆。
+ */
+export const RETIRED_CLARITIES = Object.freeze(['fuzzy', 'trace']);
+
 export const DEFAULT_MEMORY_CARD_CONFIG = Object.freeze({
   enabled: true,
   /** 整张记忆卡（渲染后的 markdown）的软上限；0 = 不限制。超过只告警，不自动删。 */
@@ -188,6 +194,9 @@ export function resolveMemoryCardPaths(memoryDir) {
     fullMarkdown: path.join(dir, 'memory-card-full.md'),
     // 旧版全量卡（单个 JSON）；首次维护时迁移到 JSONL，然后改名为 .legacy（保留可回滚）。
     fullJson: path.join(dir, 'memory-card-full.json'),
+    // 退役账本：记录「退色」或「被淘汰」时追加一行，是投递到 MemPalace 的唯一来源。
+    // 全量归档仍然收下每一条（本地可查）；这里只收已经不再活跃的记忆。
+    retiredJsonl: path.join(dir, 'memory-card-retired.jsonl'),
   };
 }
 
@@ -393,6 +402,9 @@ function normalizeRecord(item) {
     manual: raw.manual === true,
     sensitive: raw.sensitive === true,
     fullArchivedAt: String(raw.fullArchivedAt ?? ''),
+    // 退役过就写进卡里，避免每次维护重复追加退役行、重复投递。
+    retiredAt: String(raw.retiredAt ?? ''),
+    retiredReason: String(raw.retiredReason ?? ''),
     // QQ 对话另一侧：主人记录里存“她是怎么回的”；self 记录表示这条是她自己说的。
     botReply: String(raw.botReply ?? '').slice(0, 600),
     isSelf: raw.isSelf === true,
@@ -924,6 +936,48 @@ export function archiveDecayedToFull(paths, decayed, config = {}, now = Date.now
   // 追加成功后才标记，避免「标记了但没写进去」。即使 normalize 失败也标记，避免反复重试同一条坏数据。
   const stamp = iso(now);
   for (const record of pending) record.fullArchivedAt = stamp;
+  return lines.length;
+}
+
+function retiredLine(record, reason, now) {
+  const rec = normalizeRecord(record);
+  if (!rec) return null;
+  return JSON.stringify({
+    ...rec,
+    // 退役行保留当时的清晰度与正文，供 MemPalace 侧检索。
+    text: String(record.text ?? rec.text ?? '').slice(0, 4000),
+    retiredAt: iso(now),
+    retiredReason: String(reason || 'faded'),
+  });
+}
+
+/**
+ * 退役账本：只追加「已退色（模糊/残影）或已离开卡片」的记录，是 MemPalace 的唯一入档来源。
+ * 同一个 id 只写一次；写进卡里的 `retiredAt` 是这件事已经发生过的凭据。
+ */
+export function archiveRetiredToFull(paths, entries, now = Date.now()) {
+  const file = paths?.retiredJsonl;
+  if (!file || !Array.isArray(entries) || !entries.length) return 0;
+  fs.mkdirSync(paths.dir ?? path.dirname(file), { recursive: true, mode: 0o700 });
+  const seen = new Set();
+  const lines = [];
+  for (const entry of entries) {
+    const record = entry?.record;
+    if (!record || !record.id || record.retiredAt || seen.has(record.id)) continue;
+    const line = retiredLine(record, entry.reason, now);
+    if (!line) continue;
+    seen.add(record.id);
+    lines.push(line);
+  }
+  if (!lines.length) return 0;
+  fs.appendFileSync(file, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+  const stamp = iso(now);
+  for (const entry of entries) {
+    const record = entry?.record;
+    if (!record || !seen.has(record.id) || record.retiredAt) continue;
+    record.retiredAt = stamp;
+    record.retiredReason = String(entry.reason || 'faded');
+  }
   return lines.length;
 }
 
@@ -1800,7 +1854,7 @@ export function targetClarity(record, config = {}, now = Date.now()) {
  * 每日遗忘整理：每条记忆最多向目标清晰度移动一格。
  * 返回是否有变化。一次只降一档，保证「渐渐模糊」而不是一次性消失。
  */
-export function applyDailyDecay(card, config = {}, now = Date.now(), { force = false, steps = 1 } = {}) {
+export function applyDailyDecay(card, config = {}, now = Date.now(), { force = false, steps = 1, retired = null } = {}) {
   const cfg = normalizeMemoryCardConfig(config);
   const today = todayKey(now);
   if (!force && card.lastDecayDate === today) return false;
@@ -1819,6 +1873,7 @@ export function applyDailyDecay(card, config = {}, now = Date.now(), { force = f
         if (next === 'forgotten') {
           card.stats.forgotten = (Number(card.stats.forgotten) || 0) + 1;
           passChanged = true;
+          if (retired && !record.retiredAt) retired.push({ record, reason: 'forgotten' });
           continue;
         }
         record.clarity = next;
@@ -1874,7 +1929,7 @@ function stepDown(record) {
  * 压缩：按「不重要 → 老 → 已经模糊」的顺序一档一档降级，直到回到目标容量。
  * 永远不会动 pinned / 主人重要记忆。
  */
-export function compactMemoryCard(card, config = {}, { targetRatio = 0.85, now = Date.now() } = {}) {
+export function compactMemoryCard(card, config = {}, { targetRatio = 0.85, now = Date.now(), retired = null } = {}) {
   const cfg = normalizeMemoryCardConfig(config);
   const currentChars = renderMemoryCard(card, { config: cfg, full: true, now }).length;
   const baseChars = cfg.maxChars > 0 ? cfg.maxChars : (cfg.warnChars > 0 ? cfg.warnChars : currentChars);
@@ -1897,6 +1952,7 @@ export function compactMemoryCard(card, config = {}, { targetRatio = 0.85, now =
     });
     const victim = candidates[0];
     if (victim.clarity === 'trace') {
+      if (retired && !victim.retiredAt) retired.push({ record: victim, reason: 'compacted' });
       card.records = card.records.filter((record) => record.id !== victim.id);
       card.stats.forgotten = (Number(card.stats.forgotten) || 0) + 1;
       steps += 1;
@@ -2218,6 +2274,8 @@ export function maintainMemoryCard({
   if (bili.added) changed = true;
   const qq = ingestInboxLines(card, inboxLines, cfg, now, evicted);
   if (qq.added) changed = true;
+  // 退役的三种来源：摄取时被挤掉、衰减到遗忘、压缩时被丢掉。
+  const retired = evicted.map(record => ({ record, reason: 'evicted' }));
   // **先归档再衰减**：刚进来的旧记忆/冷门记忆也可能在同一次补跑里被忘掉。
   // 全量卡是 JSONL：这里只 append 新行，不读整个档案、也不重写。
   // 摄取时触及容量上限的记录也必须先进入全量档案。
@@ -2230,16 +2288,21 @@ export function maintainMemoryCard({
   if (forceDecay || needsDailyDecay(card, cfg, now)) {
     // 插件/DSH 关了一周再开：按「错过几天」补跑，而不是只降一档。
     const steps = forceDecay ? 1 : decayDaysBetween(card.lastDecayDate, now);
-    if (applyDailyDecay(card, cfg, now, { force: forceDecay, steps })) changed = true;
+    if (applyDailyDecay(card, cfg, now, { force: forceDecay, steps, retired })) changed = true;
   }
   let status = memoryCardStatus(card, cfg, now);
   // 先记住压缩前的档位：100% 自动压缩到 90% 后，用户仍然应该看到「刚满过」的提醒。
   const peakLevel = status.level;
   if (status.ratio >= 1 && cfg.autoCompact) {
-    const steps = compactMemoryCard(card, cfg, { targetRatio: 0.9, now });
+    const steps = compactMemoryCard(card, cfg, { targetRatio: 0.9, now, retired });
     if (steps) changed = true;
     status = memoryCardStatus(card, cfg, now);
   }
+  // 还留在卡里但已经退色（模糊/残影）的记录也要入档：这是「已退色」那一半条件。
+  for (const record of card.records) {
+    if (!record.retiredAt && RETIRED_CLARITIES.includes(record.clarity)) retired.push({ record, reason: 'faded' });
+  }
+  if (fullPaths && archiveRetiredToFull(fullPaths, retired, now)) changed = true;
   const alertLevel = Math.max(status.level, peakLevel);
   // 告警：80/90/100 三档；容量回落后把「已确认」一起清掉，下次再满会重新弹。
   if (alertLevel > 0) {

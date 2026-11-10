@@ -39,6 +39,7 @@ DSH_HOME/memory/
 │   ├── memory-card-prompt-bili.md
 │   ├── memory-card-full.jsonl      # 只追加的全量归档
 │   ├── memory-card-full-stats.json
+│   ├── memory-card-retired.jsonl   # 退役账本：退色/被淘汰的记忆，MemPalace 的唯一入档来源
 │   ├── archive-outbox/             # 归档投递意图、回执与冲突隔离
 │   │   ├── state.json              # 扫描偏移、退避与最近错误
 │   │   ├── pending/<archive_id>.json
@@ -82,7 +83,7 @@ DSH_HOME/memory/
 `config.json` 按段保存，写入使用同目录临时文件 + rename：
 
 - `memoryCard`：容量、衰减、清晰度、注入预算、整理时间、管理员告警等。
-- `cardInjection`：常驻记忆卡注入（默认关闭）。`enabled` 开关；`platform` 取 `qq`/`bili`（默认 `qq`，即面向主人的那份）；`excludePresets` 默认 `["dsh-superagent-router"]`；`excludeSubagents` 默认 `true`。
+- `cardInjection`：记忆卡投递（默认关闭）。`enabled` 开关；`platform` 取 `qq`/`bili`（默认 `qq`，即面向主人的那份）；`excludeSubagents` 默认 `true`（工具型子 agent 不投递）。
 - `memory`：会话记忆与成员印象相关参数。
 - `biliSync`：B 站公开记忆定期刷新开关和间隔（默认关闭）。
 - `ownerAlert`：管理员私聊容量告警（默认关闭）。
@@ -91,10 +92,14 @@ DSH_HOME/memory/
 - `history`：补历史开关、回看窗口、条数上限。
 - `archiveOut`：归档投递（默认开启）。`batchLimit` 50、`batchBytes` 200000、`statusLimit` 200、`baseDelayMs` 60000、`maxDelayMs` 1800000、`maxAttempts` 0（不限次）、`maxPending` 10000；`enabled: false` 只停止投递，不影响本地归档。
 
-`cardInjection.enabled: true` 后，记忆卡会作为常驻 section（`actmem:card`）进所有 agent 的系统提示：
-控制面（router preset）与工具型子 agent 除外，执行器（worker）与普通会话都进。内容是面向主人的
-那份卡（`platform: qq`），每次装配同步渲染并做**内容 hash** 缓存 —— 卡的写者每轮维护都会无条件
-重写文件，缓存判据如果用 mtime，就会每 10 分钟打掉一次 provider 的前缀缓存。改配置后重启 DSH 生效。
+`cardInjection.enabled: true` 后，记忆卡会作为 runtime context（`actmem:card`）进所有 agent 的会话：
+普通会话、Superagent 执行器（worker）与主 Session（router）都进，只有工具型子 agent 除外。
+内容是面向主人的那份卡（`platform: qq`），每次装配同步渲染并做**内容 hash** 缓存 —— 卡的写者
+每轮维护都会无条件重写文件，缓存判据如果用 mtime，就会每 10 分钟打掉一次 provider 的前缀缓存。
+改配置即时生效（每次装配读 `config.json`）；改代码需重启 DSH。
+
+它不再出现在系统提示词里，而是出现在 `Current runtime context` 快照中（user 角色、尾部追加、
+内容变化才发新快照）。配了 `includeRuntimeContext: false` 的 persona 会看不到卡。
 
 损坏的 JSON 不会被静默当成空配置：读取会报错并保留原文件。设置写入与提示词文件生成之间有恢复记录，
 中断后下一次读取会先恢复输出。
@@ -160,7 +165,7 @@ GET  /archive-out/status; POST /archive-out/drain
 `dsh-actmem-recap` 用 `add` 把归队简报写进衰减卡，并固定 `scope: qq`——
 `visibleFor` 会把 `scope === 'qq' && source === 'manual'` 的记录从 B 站上下文里排除。
 
-归档投递从 `memory-card-full.jsonl` 的持久化偏移生成 ArchiveIntent（首次启动从 EOF 开始，不回填存量），先按 `archive_id` 查询归档端状态再补写；回执写入 `archive-outbox/receipts.jsonl` 后才删除意图，冲突项移入 `conflict/` 且不自动重试。未拿到回执前，本地记录不会被报告为已归档。
+入档条件不是「尚未归档」，而是「已经退色或被淘汰」：记忆清晰度降到 `fuzzy`/`trace`，或被遗忘/压缩/容量挤掉时，才往 `memory-card-retired.jsonl` 追加一行（带 `retiredAt` / `retiredReason`，同一 id 只写一次）。归档投递从这份退役账本的持久化偏移生成 ArchiveIntent，先按 `archive_id` 查询归档端状态再补写；回执写入 `archive-outbox/receipts.jsonl` 后才删除意图，冲突项移入 `conflict/` 且不自动重试。未拿到回执前，本地记录不会被报告为已归档。全量归档 `memory-card-full.jsonl` 仍然收下每一条记忆，但它不再直接喂给 MemPalace。
 
 B 站刷新在内部调用中超时为 10 分钟；其余调用默认 65 秒。插件停用时先拒绝新操作，
 再等待已排队写入、B 站发布和卡片导入完成。

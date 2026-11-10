@@ -1,10 +1,11 @@
 /**
  * ActMem's outbound archive ledger.
  *
- * The local `memory-card-full.jsonl` stays the source of truth for this installation; this module only
- * derives delivery intents from it, asks the archive owner for the real state before re-sending, and
- * removes an intent only after a receipt is durably appended. A missing receipt therefore means
- * "unknown", never "archived".
+ * The ledger file only receives records that already left the active card (faded or evicted), so
+ * MemPalace holds an archive of retired memories rather than a mirror of every live memory. This
+ * module derives delivery intents from that ledger, asks the archive owner for the real state before
+ * re-sending, and removes an intent only after a receipt is durably appended. A missing receipt
+ * therefore means "unknown", never "archived".
  */
 
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -163,8 +164,8 @@ function readRange(file, start, length) {
   }
 }
 
-export function createArchiveOutbox({ stateDir, fullJsonl, config, subject, send, log = () => {}, now = Date.now } = {}) {
-  if (!stateDir || !fullJsonl) throw new Error('归档出站账本需要 stateDir 与 fullJsonl')
+export function createArchiveOutbox({ stateDir, ledgerJsonl, config, subject, send, log = () => {}, now = Date.now } = {}) {
+  if (!stateDir || !ledgerJsonl) throw new Error('归档出站账本需要 stateDir 与 ledgerJsonl')
   if (typeof subject !== 'function' || typeof send !== 'function') throw new Error('归档出站账本需要 subject 与 send')
   const outboxDir = join(stateDir, 'data', 'archive-outbox')
   const pendingDir = join(outboxDir, 'pending')
@@ -341,15 +342,13 @@ export function createArchiveOutbox({ stateDir, fullJsonl, config, subject, send
     try { state = loadState() } catch (error) { return errorResult(error) }
     try { ensureDirs() } catch (error) { return errorResult(error) }
     let stat = null
-    try { stat = existsSync(fullJsonl) ? statSync(fullJsonl) : null } catch { stat = null }
+    try { stat = existsSync(ledgerJsonl) ? statSync(ledgerJsonl) : null } catch { stat = null }
     if (!state) {
+      // 退役账本从创建起就只收新退役的记忆，不存在「存量档案」要跳过；
+      // 丢了 state 最多重扫一遍账本，回执与状态查询保证不会重复入档。
       state = defaultState()
-      if (stat) {
-        state.scan_offset = stat.size
-        state.scan_identity = identityOf(stat)
-      }
+      if (stat) state.scan_identity = identityOf(stat)
       try { writeState(state) } catch (error) { return errorResult(error) }
-      return { ok: true, initialized: true, scanned: 0, intents: 0, invalid: 0 }
     }
     if (!stat) {
       if (state.scan_identity !== null || state.scan_offset !== 0) {
@@ -365,7 +364,7 @@ export function createArchiveOutbox({ stateDir, fullJsonl, config, subject, send
       state.scan_identity = identity
     }
     let buffer
-    try { buffer = readRange(fullJsonl, state.scan_offset, stat.size - state.scan_offset) } catch (error) { return errorResult(error) }
+    try { buffer = readRange(ledgerJsonl, state.scan_offset, stat.size - state.scan_offset) } catch (error) { return errorResult(error) }
     const text = buffer.toString('utf8')
     const lastBreak = text.lastIndexOf('\n')
     if (lastBreak < 0) {
